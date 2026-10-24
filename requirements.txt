@@ -1,5 +1,8 @@
+
 requests
 sounddevice
 SpeechRecognition
 playwright
 pycaw
+pystray
+Pillow

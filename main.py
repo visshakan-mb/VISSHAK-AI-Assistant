@@ -9,14 +9,9 @@ import re
 import json
 import subprocess
 import sys
-import random
-import wave
-import struct
-import winsound
 import requests
 import http.server
 import socketserver
-import secrets
 import sounddevice as sd
 import speech_recognition as sr
 
@@ -25,6 +20,16 @@ from urllib.parse import quote_plus
 
 from playwright.sync_api import sync_playwright
 from pycaw.pycaw import AudioUtilities
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
+    TRAY_AVAILABLE = False
 
 
 # =========================================================
@@ -75,13 +80,6 @@ pulse_value = 0
 scan_offset = 0
 particle_angle = 0
 
-STARTUP_FORMATION_SECONDS = 10.0
-STARTUP_INTERFACE_SECONDS = 2.0
-formation_overlay = None
-formation_canvas = None
-shutdown_confirmation_pending = False
-restart_confirmation_pending = False
-
 recognizer = sr.Recognizer()
 
 command_queue = queue.Queue()
@@ -90,22 +88,23 @@ youtube_playwright = None
 youtube_context = None
 youtube_page = None
 
+tray_icon = None
+
 youtube_lock = threading.Lock()
+
+# Power-action safety state
+shutdown_confirmation_pending = False
+restart_confirmation_pending = False
 
 # =========================================================
 # REMOTE PHONE ACCESS // TAILSCALE
 # =========================================================
 
 REMOTE_PORT = 8765
-
-# Safety: Windows auto-start is OFF by default. Set True only if you want it.
-ENABLE_AUTOSTART = False
 remote_last_response = ""
 remote_response_version = 0
 remote_response_lock = threading.Lock()
 remote_server = None
-# A fresh per-run token is injected into the private mobile page.
-REMOTE_AUTH_TOKEN = secrets.token_urlsafe(32)
 
 
 def get_tailscale_ip():
@@ -164,12 +163,11 @@ button{border:0;border-radius:15px;font-weight:800;font-size:13px;min-height:48p
 </div>
 <script>
 const input=document.getElementById("cmd"),chat=document.getElementById("chat"),statusEl=document.getElementById("status"),micBtn=document.getElementById("micBtn"),voiceHint=document.getElementById("voiceHint");
-const REMOTE_TOKEN="__VISSHAK_REMOTE_TOKEN__";
 let recognition=null,listening=false;
 function add(who,msg){chat.textContent+="\n\n"+who+": "+msg;chat.scrollTop=chat.scrollHeight}
 function setupVoice(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){voiceHint.textContent="This browser does not support voice. Use Chrome on Android.";micBtn.disabled=true;return}recognition=new SR();recognition.lang="en-IN";recognition.continuous=false;recognition.interimResults=false;recognition.onstart=()=>{listening=true;micBtn.classList.add("listening");micBtn.textContent="🛑 LISTENING...";voiceHint.textContent="Speak now...";statusEl.textContent="● LISTENING"};recognition.onresult=e=>{const text=e.results[0][0].transcript.trim();if(text){input.value=text;sendCommand()}};recognition.onerror=e=>{listening=false;micBtn.classList.remove("listening");micBtn.textContent="🎤 VOICE COMMAND";let msg="Voice error: "+e.error+". ";if(e.error==="not-allowed"||e.error==="service-not-allowed")msg+="Open site microphone permission and Allow.";else if(e.error==="network")msg+="Check internet/browser speech service.";else msg+="Tap again and speak.";voiceHint.textContent=msg;statusEl.textContent="● LINK ONLINE"};recognition.onend=()=>{listening=false;micBtn.classList.remove("listening");micBtn.textContent="🎤 VOICE COMMAND";if(statusEl.textContent==="● LISTENING")statusEl.textContent="● LINK ONLINE"}}
 function toggleMic(){if(!recognition){setupVoice();if(!recognition)return}if(listening){recognition.stop();return}try{recognition.start()}catch(e){voiceHint.textContent="Tap once and try again."}}
-async function sendCommand(){const command=input.value.trim();if(!command)return;input.value="";add("YOU",command);statusEl.textContent="● PROCESSING";try{const r=await fetch("/command",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+REMOTE_TOKEN},body:JSON.stringify({command})});const data=await r.json();add("VISSHAK",data.response||"Command sent to PC.");statusEl.textContent="● LINK ONLINE"}catch(e){add("SYSTEM","Connection error.");statusEl.textContent="● LINK ERROR"}}
+async function sendCommand(){const command=input.value.trim();if(!command)return;input.value="";add("YOU",command);statusEl.textContent="● PROCESSING";try{const r=await fetch("/command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command})});const data=await r.json();add("VISSHAK",data.response||"Command sent to PC.");statusEl.textContent="● LINK ONLINE"}catch(e){add("SYSTEM","Connection error.");statusEl.textContent="● LINK ERROR"}}
 function quick(command){input.value=command;sendCommand()}
 input.addEventListener("keydown",e=>{if(e.key==="Enter")sendCommand()});setupVoice();
 </script>
@@ -196,7 +194,7 @@ class VisshakRemoteHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/index"):
-            data = REMOTE_HTML.replace("__VISSHAK_REMOTE_TOKEN__", REMOTE_AUTH_TOKEN).encode("utf-8")
+            data = REMOTE_HTML.encode("utf-8")
 
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -218,13 +216,6 @@ class VisshakRemoteHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/command":
             self.send_json({"error": "Not found"}, 404)
-            return
-
-        # Require the short-lived token embedded in the private mobile page.
-        expected_auth = "Bearer " + REMOTE_AUTH_TOKEN
-        supplied_auth = self.headers.get("Authorization", "")
-        if not secrets.compare_digest(supplied_auth, expected_auth):
-            self.send_json({"error": "Unauthorized"}, 401)
             return
 
         try:
@@ -1029,34 +1020,177 @@ def get_youtube_page():
 
 
 def close_youtube():
-
+    """Close the Playwright YouTube session cleanly."""
     global youtube_playwright
     global youtube_context
     global youtube_page
 
     try:
+        with youtube_lock:
+            try:
+                if youtube_page and not youtube_page.is_closed():
+                    try:
+                        youtube_page.evaluate("""() => {
+                            const v = document.querySelector('video');
+                            if (v) { v.pause(); v.muted = true; }
+                        }""")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
-        if youtube_context:
+            try:
+                if youtube_context:
+                    youtube_context.close()
+            except Exception as e:
+                print("YouTube context close error:", e)
 
-            youtube_context.close()
+            try:
+                if youtube_playwright:
+                    youtube_playwright.stop()
+            except Exception as e:
+                print("Playwright stop error:", e)
 
-    except Exception:
+            youtube_page = None
+            youtube_context = None
+            youtube_playwright = None
 
-        pass
+    except Exception as e:
+        print("YouTube close error:", e)
 
+
+def chrome_is_running():
     try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq chrome.exe"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return "chrome.exe" in (result.stdout or "").lower()
+    except Exception as e:
+        print("Chrome status error:", e)
+        return False
 
-        if youtube_playwright:
 
-            youtube_playwright.stop()
+def close_chrome():
+    """Close Chrome and verify that no chrome.exe process remains."""
+    try:
+        close_youtube()
+        time.sleep(0.5)
 
+        # /F = force close, /T = include child processes.
+        result = subprocess.run(
+            ["taskkill.exe", "/F", "/T", "/IM", "chrome.exe"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        print("Chrome taskkill:", (result.stdout or result.stderr).strip())
+
+        time.sleep(1.0)
+        if not chrome_is_running():
+            return True
+
+        # Second attempt through cmd.exe for stubborn Chrome processes.
+        subprocess.run(
+            ["cmd.exe", "/c", "taskkill /F /T /IM chrome.exe"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        time.sleep(1.0)
+        return not chrome_is_running()
+
+    except Exception as e:
+        print("Chrome close error:", e)
+        return not chrome_is_running()
+
+
+def lock_pc():
+    """Lock the current Windows session."""
+    try:
+        result = subprocess.run(
+            ["rundll32.exe", "user32.dll,LockWorkStation"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        print("Lock command result:", result.returncode, result.stderr.strip())
+        return result.returncode == 0
+    except Exception as e:
+        print("PC lock error:", e)
+        return False
+
+
+def request_shutdown():
+    global shutdown_confirmation_pending
+    global restart_confirmation_pending
+    restart_confirmation_pending = False
+    shutdown_confirmation_pending = True
+    speak("Shutdown confirmation required. Say confirm shutdown or cancel.")
+
+
+def request_restart():
+    global shutdown_confirmation_pending
+    global restart_confirmation_pending
+    shutdown_confirmation_pending = False
+    restart_confirmation_pending = True
+    speak("Restart confirmation required. Say confirm restart or cancel.")
+
+
+def shutdown_pc():
+    global shutdown_confirmation_pending
+    shutdown_confirmation_pending = False
+    try:
+        result = subprocess.run(
+            ["shutdown.exe", "/s", "/f", "/t", "10"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        output = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+        print("Shutdown command:", result.returncode, output)
+        if result.returncode == 0:
+            speak("Shutdown scheduled. PC will turn off in ten seconds.")
+        else:
+            speak("Windows shutdown command failed. Please run VISSHAK with normal Windows permission.")
+    except Exception as e:
+        print("Shutdown error:", e)
+        speak("Shutdown command failed.")
+
+
+def restart_pc():
+    global restart_confirmation_pending
+    restart_confirmation_pending = False
+    try:
+        result = subprocess.run(
+            ["shutdown.exe", "/r", "/f", "/t", "10"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        output = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+        print("Restart command:", result.returncode, output)
+        if result.returncode == 0:
+            speak("Restart scheduled. PC will restart in ten seconds.")
+        else:
+            speak("Windows restart command failed.")
+    except Exception as e:
+        print("Restart error:", e)
+        speak("Restart command failed.")
+
+
+def cancel_power_action():
+    global shutdown_confirmation_pending
+    global restart_confirmation_pending
+    shutdown_confirmation_pending = False
+    restart_confirmation_pending = False
+    try:
+        subprocess.run(["shutdown", "/a"], capture_output=True, text=True, timeout=5)
     except Exception:
-
         pass
-
-    youtube_page = None
-    youtube_context = None
-    youtube_playwright = None
+    speak("Power action cancelled.")
 
 
 # =========================================================
@@ -1693,79 +1827,6 @@ website_map = {
 
 
 # =========================================================
-# WINDOWS SYSTEM CONTROLS
-# =========================================================
-
-def close_chrome():
-    try:
-        close_youtube()
-        subprocess.run(["taskkill.exe","/F","/T","/IM","chrome.exe"],capture_output=True,text=True,timeout=15)
-        time.sleep(0.8)
-        return True
-    except Exception as e:
-        print("Chrome close error:",e); return False
-
-
-def lock_pc():
-    try:
-        subprocess.Popen(["rundll32.exe","user32.dll,LockWorkStation"]); return True
-    except Exception as e:
-        print("PC lock error:",e); return False
-
-
-def request_shutdown():
-    global shutdown_confirmation_pending,restart_confirmation_pending
-    restart_confirmation_pending=False; shutdown_confirmation_pending=True
-    speak("Shutdown confirmation required. Say confirm shutdown or cancel.")
-
-
-def request_restart():
-    global shutdown_confirmation_pending,restart_confirmation_pending
-    shutdown_confirmation_pending=False; restart_confirmation_pending=True
-    speak("Restart confirmation required. Say confirm restart or cancel.")
-
-
-def cancel_power_action():
-    global shutdown_confirmation_pending,restart_confirmation_pending
-    shutdown_confirmation_pending=False; restart_confirmation_pending=False
-    try: subprocess.run(["shutdown.exe","/a"],capture_output=True,text=True,timeout=5)
-    except Exception: pass
-    speak("Power action cancelled.")
-
-
-def shutdown_pc():
-    global shutdown_confirmation_pending
-    shutdown_confirmation_pending=False
-    try:
-        result=subprocess.run(["shutdown.exe","/s","/f","/t","10"],capture_output=True,text=True,timeout=5)
-        speak("Shutdown scheduled. PC will turn off in ten seconds." if result.returncode==0 else "Windows shutdown command failed.")
-    except Exception as e:
-        print("Shutdown error:",e); speak("Shutdown command failed.")
-
-
-def restart_pc():
-    global restart_confirmation_pending
-    restart_confirmation_pending=False
-    try:
-        result=subprocess.run(["shutdown.exe","/r","/f","/t","10"],capture_output=True,text=True,timeout=5)
-        speak("Restart scheduled. PC will restart in ten seconds." if result.returncode==0 else "Windows restart command failed.")
-    except Exception as e:
-        print("Restart error:",e); speak("Restart command failed.")
-
-
-def show_interface():
-    try:
-        root.deiconify(); root.lift(); root.focus_force(); speak("Interface visible.")
-    except Exception as e: print("Show interface error:",e)
-
-
-def hide_interface():
-    try:
-        root.withdraw(); speak("Interface hidden. VISSHAK continues in background.")
-    except Exception as e: print("Hide interface error:",e)
-
-
-# =========================================================
 # COMMAND ENGINE
 # =========================================================
 
@@ -1819,32 +1880,155 @@ def process_command(
 
     lower_text = text.lower().strip()
 
+    # -----------------------------------------------------
+    # POWER ACTION CONFIRMATION
+    # -----------------------------------------------------
+    global shutdown_confirmation_pending
+    global restart_confirmation_pending
+
+    if shutdown_confirmation_pending:
+        if (
+            "confirm shutdown" in lower_text
+            or lower_text == "confirm"
+            or "yes shutdown" in lower_text
+            or "shutdown confirm" in lower_text
+        ):
+            shutdown_pc()
+            return
+        if (
+            "cancel" in lower_text
+            or lower_text == "no"
+            or "cancel shutdown" in lower_text
+        ):
+            cancel_power_action()
+            return
+        speak("Shutdown is waiting for confirmation. Say confirm shutdown or cancel.")
+        return
+
+    if restart_confirmation_pending:
+        if (
+            "confirm restart" in lower_text
+            or lower_text == "confirm"
+            or "yes restart" in lower_text
+            or "restart confirm" in lower_text
+        ):
+            restart_pc()
+            return
+        if (
+            "cancel" in lower_text
+            or lower_text == "no"
+            or "cancel restart" in lower_text
+        ):
+            cancel_power_action()
+            return
+        speak("Restart is waiting for confirmation. Say confirm restart or cancel.")
+        return
+
     set_status(
         "THINKING"
     )
 
     # =====================================================
-    # POWER CONFIRMATION
+    # PC CONTROL
     # =====================================================
 
-    global shutdown_confirmation_pending, restart_confirmation_pending
-
-    if shutdown_confirmation_pending:
-        if "confirm shutdown" in lower_text or lower_text in ("confirm", "yes shutdown", "shutdown confirm"):
-            shutdown_pc()
-        elif "cancel" in lower_text or "stop shutdown" in lower_text:
-            cancel_power_action()
+    if (
+        "close chrome" in lower_text
+        or "close google chrome" in lower_text
+        or "close browser" in lower_text
+        or "exit chrome" in lower_text
+        or "quit chrome" in lower_text
+    ):
+        if close_chrome():
+            speak("Chrome closed completely.")
         else:
-            speak("Say confirm shutdown or cancel.")
+            speak("Chrome close panna mudiyala.")
         return
 
-    if restart_confirmation_pending:
-        if "confirm restart" in lower_text or lower_text in ("confirm", "yes restart", "restart confirm"):
-            restart_pc()
-        elif "cancel" in lower_text or "stop restart" in lower_text:
-            cancel_power_action()
+    if (
+        "close youtube" in lower_text
+        or "exit youtube" in lower_text
+        or "quit youtube" in lower_text
+    ):
+        close_youtube()
+        # YouTube is launched in a dedicated Chrome process/profile.
+        # Closing Chrome after the Playwright cleanup guarantees the window exits.
+        if close_chrome():
+            speak("YouTube and Chrome closed.")
         else:
-            speak("Say confirm restart or cancel.")
+            speak("YouTube closed. Chrome close panna mudiyala.")
+        return
+
+    if (
+        "lock pc" in lower_text
+        or "lock the pc" in lower_text
+        or "lock computer" in lower_text
+        or "lock the computer" in lower_text
+        or "pc lock" in lower_text
+        or "computer lock" in lower_text
+        or lower_text == "lock"
+        or lower_text == "lock it"
+        or "lock my pc" in lower_text
+    ):
+        if lock_pc():
+            speak("Locking the PC.")
+        else:
+            speak("PC lock panna mudiyala.")
+        return
+
+    if (
+        "shutdown pc" in lower_text
+        or "shutdown the pc" in lower_text
+        or "shutdown computer" in lower_text
+        or "shutdown the computer" in lower_text
+        or "turn off pc" in lower_text
+        or "turn off the pc" in lower_text
+        or "power off pc" in lower_text
+        or "power off the pc" in lower_text
+    ):
+        request_shutdown()
+        return
+
+    if (
+        "restart pc" in lower_text
+        or "restart the pc" in lower_text
+        or "restart computer" in lower_text
+        or "restart the computer" in lower_text
+        or "reboot pc" in lower_text
+        or "reboot computer" in lower_text
+    ):
+        request_restart()
+        return
+
+    if (
+        "cancel shutdown" in lower_text
+        or "cancel restart" in lower_text
+        or "cancel power" in lower_text
+        or lower_text == "cancel"
+    ):
+        cancel_power_action()
+        return
+
+    # =====================================================
+    # CHROME NAVIGATION
+    # =====================================================
+
+    if lower_text in ("chrome back", "browser back", "go back"):
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-Command",
+                               "(New-Object -ComObject WScript.Shell).SendKeys('%{LEFT}')"])
+            speak("Going back in Chrome.")
+        except Exception:
+            speak("Chrome back panna mudiyala.")
+        return
+
+    if lower_text in ("chrome forward", "browser forward", "go forward"):
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-Command",
+                               "(New-Object -ComObject WScript.Shell).SendKeys('%{RIGHT}')"])
+            speak("Going forward in Chrome.")
+        except Exception:
+            speak("Chrome forward panna mudiyala.")
         return
 
     # =====================================================
@@ -1873,59 +2057,6 @@ def process_command(
             root.destroy
         )
 
-        return
-
-    # =====================================================
-    # INTERFACE SHOW / HIDE
-    # =====================================================
-
-    if lower_text in ("open interface", "show interface", "interface open", "visshak open interface"):
-        show_interface()
-        return
-
-    if lower_text in ("hide interface", "close interface", "interface hide", "visshak hide interface"):
-        hide_interface()
-        return
-
-    # =====================================================
-    # CHROME CLOSE
-    # =====================================================
-
-    if "close chrome" in lower_text or lower_text in ("chrome close", "close chrome pannu", "chrome ah close pannu"):
-        speak("Chrome closed." if close_chrome() else "Chrome close panna mudiyala.")
-        return
-
-    # =====================================================
-    # YOUTUBE CLOSE
-    # =====================================================
-
-    if "close youtube" in lower_text or "youtube close" in lower_text:
-        close_youtube()
-        speak("YouTube closed.")
-        return
-
-    # =====================================================
-    # LOCK PC
-    # =====================================================
-
-    if lower_text in ("lock", "lock pc", "lock computer", "pc lock", "computer lock", "lock pannu", "pc ah lock pannu") or lower_text.startswith("lock pc"):
-        speak("PC locked." if lock_pc() else "PC lock panna mudiyala.")
-        return
-
-    # =====================================================
-    # SHUTDOWN / RESTART
-    # =====================================================
-
-    if "shutdown pc" in lower_text or "shutdown computer" in lower_text or lower_text in ("shutdown", "pc shutdown", "shutdown pannu"):
-        request_shutdown()
-        return
-
-    if "restart pc" in lower_text or "restart computer" in lower_text or lower_text in ("restart", "pc restart", "restart pannu"):
-        request_restart()
-        return
-
-    if lower_text in ("cancel", "cancel power", "cancel shutdown", "cancel restart"):
-        cancel_power_action()
         return
 
     # =====================================================
@@ -2301,11 +2432,9 @@ def process_command(
 
                 youtube_page.bring_to_front()
 
-                clicked = youtube_page.locator("button.ytp-next-button, a.ytp-next-button").first
-                if clicked.count():
-                    clicked.click()
-                else:
-                    youtube_page.keyboard.press("Shift+N")
+                youtube_page.keyboard.press(
+                    "Shift+N"
+                )
 
                 speak(
                     "Next song."
@@ -2349,11 +2478,9 @@ def process_command(
 
                 youtube_page.bring_to_front()
 
-                clicked = youtube_page.locator("button.ytp-prev-button, a.ytp-prev-button").first
-                if clicked.count():
-                    clicked.click()
-                else:
-                    youtube_page.keyboard.press("Shift+P")
+                youtube_page.keyboard.press(
+                    "Shift+P"
+                )
 
                 speak(
                     "Previous song."
@@ -2770,9 +2897,9 @@ def voice_loop():
 
             try:
 
-                # Google speech recognition requires an internet connection.
                 text = (
-                    recognizer.recognize_google(
+                    recognizer
+                    .recognize_google(
                         audio_data
                     )
                 )
@@ -2976,163 +3103,6 @@ def exit_fullscreen(event=None):
         "-fullscreen",
         False
     )
-
-
-# =========================================================
-# STARTUP FORMATION // ORIGINAL FUTURISTIC SFX
-# =========================================================
-
-SFX_DIR = os.path.abspath("visshak_sfx")
-
-
-def _write_wav(path, samples, sample_rate=44100):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        frames = bytearray()
-        for value in samples:
-            value = max(-1.0, min(1.0, value))
-            frames.extend(struct.pack("<h", int(value * 32767)))
-        wf.writeframes(frames)
-
-
-def _make_sfx_files():
-    os.makedirs(SFX_DIR, exist_ok=True)
-    names = ["hum.wav", "whoosh.wav", "charge.wav", "lock.wav", "power.wav"]
-    paths = [os.path.join(SFX_DIR, n) for n in names]
-    if all(os.path.exists(x) for x in paths):
-        return paths
-    sr = 44100
-    n = int(sr * 2.2)
-    hum=[]
-    for i in range(n):
-        t=i/sr; env=min(1.0,t*4.0)*min(1.0,(2.2-t)*4.0)
-        hum.append((0.16*math.sin(2*math.pi*55*t)+0.06*math.sin(2*math.pi*110*t))*env)
-    _write_wav(paths[0],hum,sr)
-    n=int(sr*1.0); whoosh=[]
-    for i in range(n):
-        t=i/sr; f=180+1450*t*t; env=math.sin(math.pi*t)
-        whoosh.append(0.22*math.sin(2*math.pi*f*t)*env)
-    _write_wav(paths[1],whoosh,sr)
-    n=int(sr*1.8); charge=[]
-    for i in range(n):
-        t=i/sr; f=260+1100*t; env=(t/1.8)**0.7*min(1.0,(1.8-t)*5)
-        charge.append((0.20*math.sin(2*math.pi*f*t)+0.07*math.sin(2*math.pi*2*f*t))*env)
-    _write_wav(paths[2],charge,sr)
-    n=int(sr*0.16); lock=[]
-    for i in range(n):
-        t=i/sr; env=max(0.0,1.0-t/0.16)**2; freq=900 if t<0.055 else 1450
-        lock.append(0.32*math.sin(2*math.pi*freq*t)*env)
-    _write_wav(paths[3],lock,sr)
-    n=int(sr*1.4); power=[]
-    for i in range(n):
-        t=i/sr; f=160+900*(t/1.4); env=min(1.0,t*7)*min(1.0,(1.4-t)*5)
-        power.append((0.24*math.sin(2*math.pi*f*t)+0.10*math.sin(2*math.pi*2*f*t))*env)
-    _write_wav(paths[4],power,sr)
-    return paths
-
-
-def play_startup_sfx(name, wait=False):
-    if not sound_enabled:
-        return
-    try:
-        paths=_make_sfx_files()
-        path={"hum":paths[0],"whoosh":paths[1],"charge":paths[2],"lock":paths[3],"power":paths[4]}.get(name)
-        if path:
-            winsound.PlaySound(path, winsound.SND_FILENAME | (winsound.SND_SYNC if wait else winsound.SND_ASYNC))
-    except Exception as e:
-        print("Startup SFX error:",e)
-
-
-def stop_startup_sfx():
-    try:
-        winsound.PlaySound(None,winsound.SND_PURGE)
-    except Exception:
-        pass
-
-
-def start_formation_sequence():
-    global formation_overlay, formation_canvas
-    try:
-        root.withdraw()
-        formation_overlay=tk.Toplevel(root)
-        formation_overlay.overrideredirect(True)
-        formation_overlay.configure(bg="#010208")
-        formation_overlay.attributes("-topmost",True)
-        try:
-            formation_overlay.attributes("-fullscreen",True)
-        except Exception:
-            formation_overlay.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
-        formation_canvas=tk.Canvas(formation_overlay,bg="#010208",highlightthickness=0)
-        formation_canvas.pack(fill="both",expand=True)
-        started=time.time()
-        particles=[]
-        for _ in range(260):
-            particles.append({"a":random.uniform(0,math.tau),"r":random.uniform(250,1050),"s":random.uniform(0.7,1.5),"size":random.choice([1,1,2,2,3])})
-        sound_schedule=[(0.0,"hum"),(1.4,"whoosh"),(3.0,"whoosh"),(4.2,"charge"),(6.7,"lock"),(7.1,"lock"),(7.5,"lock"),(8.4,"power")]
-        played=set()
-        def draw():
-            if not running or formation_overlay is None: return
-            try:
-                now=time.time()-started; w=max(formation_canvas.winfo_width(),900); h=max(formation_canvas.winfo_height(),600); cx,cy=w/2,h/2
-                formation_canvas.delete("all")
-                for x in range(0,w,48): formation_canvas.create_line(x,0,x,h,fill="#071026")
-                for y in range(0,h,48): formation_canvas.create_line(0,y,w,y,fill="#071026")
-                c,pad=70,28
-                for x,y,sx,sy in [(pad,pad,1,1),(w-pad,pad,-1,1),(pad,h-pad,1,-1),(w-pad,h-pad,-1,-1)]:
-                    formation_canvas.create_line(x,y,x+sx*c,y,fill="#00eaff",width=3); formation_canvas.create_line(x,y,x,y+sy*c,fill="#00eaff",width=3)
-                particle_p=min(now/2.0,1.0)
-                for item in particles:
-                    rr=item["r"]*(1-particle_p); a=item["a"]+now*item["s"]; x=cx+math.cos(a)*rr; y=cy+math.sin(a)*rr; z=item["size"]
-                    formation_canvas.create_oval(x-z,y-z,x+z,y+z,fill="#63efff",outline="")
-                ring_p=max(0.0,min((now-1.2)/3.0,1.0))
-                for idx,base in enumerate([180,270,370,470]):
-                    radius=base*ring_p
-                    if radius<2: continue
-                    rot=now*(70 if idx%2==0 else -52)+idx*35
-                    formation_canvas.create_oval(cx-radius,cy-radius,cx+radius,cy+radius,outline="#123b69",width=1)
-                    for j in range(4):
-                        st=rot+j*90
-                        formation_canvas.create_arc(cx-radius,cy-radius,cx+radius,cy+radius,start=st,extent=32,outline=["#00eaff","#438cff","#a66cff","#ff55c8"][idx],width=4)
-                core_p=max(0.0,min((now-4.0)/2.0,1.0))
-                if core_p>0:
-                    pulse=1+0.08*math.sin(now*12)
-                    for r in [110,90,70,52]:
-                        rr=r*core_p*pulse; formation_canvas.create_oval(cx-rr,cy-rr,cx+rr,cy+rr,outline="#145d8c",width=2)
-                    rr=30+42*core_p; formation_canvas.create_oval(cx-rr,cy-rr,cx+rr,cy+rr,fill="#59edff",outline="#eaffff",width=3)
-                v_p=max(0.0,min((now-5.7)/2.2,1.0))
-                if v_p>0:
-                    scale=0.25+0.75*v_p
-                    pts=[(-150*scale,-90*scale),(-75*scale,110*scale),(0,175*scale),(75*scale,110*scale),(150*scale,-90*scale)]
-                    pts=[(cx+x,cy+y) for x,y in pts]
-                    for k in range(len(pts)-1): formation_canvas.create_line(pts[k],pts[k+1],fill="#00f6ff",width=max(3,int(8*scale)),capstyle="round")
-                    formation_canvas.create_text(cx,cy+245*scale,text="VISSHAK",fill="#dfffff",font=("Consolas",max(18,int(40*scale)),"bold"))
-                if now>=8.0:
-                    formation_canvas.create_text(cx,cy-300,text="VISSHAK // CORE ASSEMBLY",fill="#00f6ff",font=("Consolas",13,"bold"))
-                    formation_canvas.create_text(cx,cy+315,text="SYSTEM ONLINE  •  BOSS LINK ACTIVE",fill="#8c7cff",font=("Consolas",11,"bold"))
-                sy=(now*420)%h; formation_canvas.create_line(0,sy,w,sy,fill="#0e5272",width=2)
-                for t,sound in sound_schedule:
-                    if now>=t and (t,sound) not in played:
-                        played.add((t,sound)); threading.Thread(target=play_startup_sfx,args=(sound,),daemon=True).start()
-                if now<STARTUP_FORMATION_SECONDS:
-                    formation_overlay.after(16,draw)
-                else:
-                    stop_startup_sfx(); formation_overlay.destroy(); formation_overlay=None; root.deiconify(); root.lift()
-                    try: root.attributes("-topmost",True); root.after(300,lambda:root.attributes("-topmost",False))
-                    except Exception: pass
-                    if os.environ.get("VISSHAK_BACKGROUND")=="1": root.after(int(STARTUP_INTERFACE_SECONDS*1000),lambda:root.withdraw())
-            except Exception as e:
-                print("Formation animation error:",e)
-                try: formation_overlay.destroy()
-                except Exception: pass
-                formation_overlay=None; root.deiconify()
-        formation_overlay.after(100,draw)
-    except Exception as e:
-        print("Formation startup error:",e)
-        try: root.deiconify()
-        except Exception: pass
 
 
 # =========================================================
@@ -4404,6 +4374,104 @@ footer_right.pack(
 
 
 # =========================================================
+# SYSTEM TRAY
+# =========================================================
+
+def show_visshak_window():
+    try:
+        root.deiconify()
+        root.after(50, root.lift)
+        root.after(100, root.focus_force)
+        try:
+            root.state("normal")
+        except Exception:
+            pass
+    except Exception as e:
+        print("SHOW UI ERROR:", e)
+
+
+def hide_visshak_window():
+    try:
+        root.withdraw()
+    except Exception as e:
+        print("HIDE UI ERROR:", e)
+
+
+def tray_open(icon=None, item=None):
+    ui_call(show_visshak_window)
+
+
+def tray_hide(icon=None, item=None):
+    ui_call(hide_visshak_window)
+
+
+def tray_toggle_voice(icon=None, item=None):
+    ui_call(toggle_voice)
+
+
+def tray_toggle_sound(icon=None, item=None):
+    ui_call(toggle_sound)
+
+
+def tray_exit(icon=None, item=None):
+    ui_call(on_close)
+
+
+def create_tray_image():
+    if not TRAY_AVAILABLE:
+        return None
+
+    image = Image.new("RGBA", (64, 64), (4, 10, 18, 255))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((7, 7, 57, 57), outline=(0, 240, 255, 255), width=3)
+    draw.ellipse((15, 15, 49, 49), outline=(150, 70, 255, 255), width=2)
+    draw.ellipse((23, 23, 41, 41), fill=(0, 220, 255, 255))
+    draw.text((28, 25), "V", fill=(4, 10, 18, 255))
+    return image
+
+
+def start_system_tray():
+    global tray_icon
+
+    if not TRAY_AVAILABLE:
+        print("SYSTEM TRAY: pystray is not installed.")
+        return
+
+    try:
+        menu = pystray.Menu(
+            pystray.MenuItem("OPEN VISSHAK", tray_open, default=True),
+            pystray.MenuItem("HIDE VISSHAK", tray_hide),
+            pystray.MenuItem("VOICE ON / OFF", tray_toggle_voice),
+            pystray.MenuItem("SOUND ON / OFF", tray_toggle_sound),
+            pystray.MenuItem("EXIT VISSHAK", tray_exit)
+        )
+
+        tray_icon = pystray.Icon(
+            "VISSHAK",
+            create_tray_image(),
+            "VISSHAK - Personal AI",
+            menu
+        )
+
+        print("SYSTEM TRAY: VISSHAK tray icon active.")
+        tray_icon.run()
+
+    except Exception as e:
+        print("SYSTEM TRAY ERROR:", e)
+
+
+def stop_system_tray():
+    global tray_icon
+
+    try:
+        if tray_icon is not None:
+            tray_icon.stop()
+    except Exception:
+        pass
+    tray_icon = None
+
+
+# =========================================================
 # CLOSE APPLICATION
 # =========================================================
 
@@ -4486,9 +4554,8 @@ add_chat(
 
 def startup():
 
-    # Wait until the formation + short interface reveal has completed.
     time.sleep(
-        STARTUP_FORMATION_SECONDS + STARTUP_INTERFACE_SECONDS + 0.5
+        1
     )
 
     if not running:
@@ -4584,8 +4651,7 @@ def setup_tailscale_https():
 
 def start_engines():
 
-    if ENABLE_AUTOSTART:
-        install_autostart()
+    install_autostart()
 
     time.sleep(
         2
@@ -4617,15 +4683,9 @@ def start_engines():
 
 
 # =========================================================
-# STARTUP FORMATION + MAIN HUD
+# START ANIMATION
 # =========================================================
 
-try:
-    root.withdraw()
-except Exception:
-    pass
-
-start_formation_sequence()
 animate_core()
 
 
@@ -4638,6 +4698,7 @@ threading.Thread(
     daemon=True
 ).start()
 
+
 threading.Thread(
     target=start_engines,
     daemon=True
@@ -4647,5 +4708,12 @@ threading.Thread(
 # =========================================================
 # RUN VISSHAK
 # =========================================================
+
+if os.environ.get("VISSHAK_BACKGROUND") == "1":
+    try:
+        root.withdraw()
+        print("VISSHAK: background mode active.")
+    except Exception:
+        pass
 
 root.mainloop()
