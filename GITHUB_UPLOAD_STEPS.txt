@@ -1,0 +1,7 @@
+GITHUB UPLOAD CHECKLIST
+
+1. Create a public or private repository named VISSHAK-AI-Assistant.
+2. Do not upload memory.json, .venv, or visshak_youtube_profile.
+3. Upload main.py, README.md, requirements.txt, and .gitignore.
+4. Confirm README preview looks correct.
+5. Run the app locally before claiming every feature works.

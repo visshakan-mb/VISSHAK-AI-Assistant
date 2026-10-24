@@ -1,0 +1,5 @@
+requests
+sounddevice
+SpeechRecognition
+playwright
+pycaw
