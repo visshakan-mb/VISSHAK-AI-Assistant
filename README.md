@@ -85,3 +85,7 @@ Personal/student development project. Hardware, Windows, microphone, browser, Ol
 ## License
 
 No license has been selected yet. Add a license only after choosing how others may use, modify, and redistribute the project.
+
+## VISSHAK AI Screenshot
+
+![VISSHAK AI](Screenshot/visshak%20pic.PNG)
